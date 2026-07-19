@@ -569,7 +569,7 @@ fi
 compose_cmd=""
 if command -v docker-compose >/dev/null 2>&1; then
   compose_cmd="docker-compose"
-elif docker compose version >/dev/null 2>&1; then
+elif $SUDO docker compose version >/dev/null 2>&1; then
   compose_cmd="docker compose"
 fi
 
@@ -611,6 +611,7 @@ pg_user=""
 pg_dump_file=""
 pg_data_volumes=()
 manifest_project=""
+archived_compose_name=""
 
 if [ -f "$manifest" ]; then
   if command -v jq >/dev/null 2>&1; then
@@ -697,6 +698,14 @@ PY
       echo "ERROR: A logical PostgreSQL restore is destructive; use --overwrite to confirm replacement" >&2
       exit 2
     fi
+    [ -n "$compose_cmd" ] || { echo "ERROR: Docker Compose is required for logical PostgreSQL restore; no services or volumes were changed" >&2; exit 7; }
+    for file in "$stack_src/docker-compose.yml" "$stack_src/docker-compose.yaml" "$stack_src/compose.yml" "$stack_src/compose.yaml"; do
+      if [ -f "$file" ]; then
+        archived_compose_name=$(basename "$file")
+        break
+      fi
+    done
+    [ -n "$archived_compose_name" ] || { echo "ERROR: Restored archive has no root Compose file; no services or volumes were changed" >&2; exit 7; }
     logical_restore=1
   fi
 else
@@ -709,9 +718,9 @@ run_restore_compose() {
   (
     cd "$workdir"
     if [ -n "$manifest_project" ]; then
-      $compose_cmd -p "$manifest_project" "$@"
+      $SUDO $compose_cmd -p "$manifest_project" "$@"
     else
-      $compose_cmd "$@"
+      $SUDO $compose_cmd "$@"
     fi
   )
 }
@@ -785,12 +794,7 @@ if [ -d "$vol_src" ]; then
 fi
 
 if [ "$logical_restore" = "1" ]; then
-  [ -n "$compose_cmd" ] || { echo "ERROR: Docker Compose is required for logical PostgreSQL restore" >&2; exit 7; }
-  compose_file=""
-  for file in "$target_dir/docker-compose.yml" "$target_dir/docker-compose.yaml" "$target_dir/compose.yml" "$target_dir/compose.yaml"; do
-    if [ -f "$file" ]; then compose_file="$file"; break; fi
-  done
-  [ -n "$compose_file" ] || { echo "ERROR: No Compose file found in restored stack" >&2; exit 7; }
+  compose_file="$target_dir/$archived_compose_name"
   echo "Starting only PostgreSQL service: $pg_service"
   run_restore_compose "$target_dir" -f "$compose_file" up -d "$pg_service"
   ready=0

@@ -17,6 +17,13 @@ remote="${!#}"
 exec bash -c "$remote"
 EOF
 
+cat > "$work/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${MOCK_SUDO_LOG:-}" ]; then printf '%s\n' "$*" >> "$MOCK_SUDO_LOG"; fi
+exec "$@"
+EOF
+
 cat > "$work/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -24,7 +31,7 @@ scenario=${MOCK_SCENARIO:-official}
 printf '%s\n' "$*" >> "${MOCK_DOCKER_LOG:-/dev/null}"
 if [ "${1:-}" = compose ] || [[ "$0" = *docker-compose ]]; then
   [ "${1:-}" != compose ] || shift
-  if [ "${1:-}" = version ]; then exit 0; fi
+  if [ "${1:-}" = version ]; then [ ! -f "$MOCK_VOLUME_ROOT/disable-compose" ]; exit; fi
   while [ "${1:-}" = -p ] || [ "${1:-}" = -f ]; do shift 2; done
   case "${1:-}" in
     config)
@@ -145,7 +152,7 @@ case "${1:-}" in
     tar -C "$stage/src" -cf - "$archive_root" ;;
 esac
 EOF
-chmod +x "$work/bin/ssh" "$work/bin/docker"
+chmod +x "$work/bin/ssh" "$work/bin/sudo" "$work/bin/docker"
 ln -s docker "$work/bin/docker-compose"
 
 export PATH="$work/bin:$PATH"
@@ -219,6 +226,47 @@ mv "$manifest.reformatted" "$manifest"
 reformatted_archive="$work/reformatted-v2.tar.gz"
 tar -C "$work/out/official/extracted" -czf "$reformatted_archive" sample
 
+# Missing Compose must be detected before stopping services or changing files and volumes.
+mkdir -p "$work/no-compose-target"
+printf 'services: {}\n' > "$work/no-compose-target/compose.yml"
+no_compose_log="$work/no-compose.log"
+no_compose_docker_log="$work/no-compose-docker.log"
+: > "$no_compose_docker_log"
+: > "$MOCK_VOLUME_ROOT/disable-compose"
+unlink "$work/bin/docker-compose"
+if PATH="$work/bin:/usr/bin:/bin" MOCK_SCENARIO=no_compose MOCK_DOCKER_LOG="$no_compose_docker_log" \
+  "$repo/compose-remote.sh" restore-remote --host mock --backup "$reformatted_archive" \
+  --target "$work/no-compose-target" --overwrite --no-sudo >"$no_compose_log" 2>&1; then
+  fail 'missing Compose exits before logical restore mutation'
+fi
+ln -s docker "$work/bin/docker-compose"
+unlink "$MOCK_VOLUME_ROOT/disable-compose"
+ok 'missing Compose exits before logical restore mutation'
+assert_contains "$no_compose_log" 'Docker Compose is required' 'missing Compose prints a clear preflight error'
+if grep -Eq ' (stop|down)$|volume rm|^run |^exec ' "$no_compose_docker_log"; then fail 'missing Compose preflight performs no destructive Docker action'; fi
+ok 'missing Compose preflight performs no destructive Docker action'
+
+# A logical archive without a root Compose file must also fail before mutation.
+missing_stack_root="$work/missing-compose-stack"
+mkdir -p "$missing_stack_root" "$work/missing-compose-target"
+cp -a "$work/out/official/extracted/sample" "$missing_stack_root/sample"
+mv "$missing_stack_root/sample/stack/compose.yml" "$missing_stack_root/compose.yml.omitted"
+missing_stack_archive="$work/missing-compose-stack.tar.gz"
+tar -C "$missing_stack_root" -czf "$missing_stack_archive" sample
+printf 'services: {}\n' > "$work/missing-compose-target/compose.yml"
+missing_stack_log="$work/missing-compose-stack.log"
+missing_stack_docker_log="$work/missing-compose-stack-docker.log"
+: > "$missing_stack_docker_log"
+if MOCK_SCENARIO=official MOCK_DOCKER_LOG="$missing_stack_docker_log" \
+  "$repo/compose-remote.sh" restore-remote --host mock --backup "$missing_stack_archive" \
+  --target "$work/missing-compose-target" --overwrite --no-sudo >"$missing_stack_log" 2>&1; then
+  fail 'missing archived Compose file exits before logical restore mutation'
+fi
+ok 'missing archived Compose file exits before logical restore mutation'
+assert_contains "$missing_stack_log" 'archive has no root Compose file' 'missing archived Compose file prints a clear preflight error'
+if grep -Eq ' (stop|down)$|volume rm|^run |^exec ' "$missing_stack_docker_log"; then fail 'missing archived Compose file performs no destructive Docker action'; fi
+ok 'missing archived Compose file performs no destructive Docker action'
+
 # A logical dump without a named PGDATA volume must fail before any destructive action.
 unsupported_root="$work/unsupported-storage"
 mkdir -p "$unsupported_root" "$work/unsupported-target"
@@ -261,6 +309,14 @@ assert_contains "$work/restore.log" 'Restored non-database volume: sample_upload
 assert_contains "$work/restore.log" 'Logical PostgreSQL restore succeeded' 'new archive performs logical PostgreSQL restore'
 assert_contains "$work/docker.log" '-p sample' 'restore pins Compose to the project name recorded in the manifest'
 assert_contains "$work/restore.log" 'System check identified no issues' 'detected Django service is verified'
+
+# --sudo must prefix Compose as well as direct Docker volume operations.
+sudo_log="$work/sudo.log"
+: > "$sudo_log"
+MOCK_SCENARIO=official MOCK_SUDO_LOG="$sudo_log" \
+  "$repo/compose-remote.sh" restore-remote --host mock --backup "$reformatted_archive" \
+  --target "$work/sudo-restored" --overwrite --sudo >"$work/sudo-restore.log" 2>&1
+assert_contains "$sudo_log" 'docker-compose -p sample' '--sudo prefixes Compose restore operations'
 
 # A failed pg_restore must stop the workflow before any remaining services start.
 restore_fail_log="$work/restore-fail.log"
