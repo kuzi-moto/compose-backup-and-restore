@@ -25,6 +25,8 @@ New archives have this structure:
 
 The manifest identifies the project, host, Compose file, volumes, and non-secret PostgreSQL restore metadata. PostgreSQL's raw data volume remains in the archive as a secondary copy so existing volume behavior is retained. A raw data directory copied while PostgreSQL is online is not guaranteed to be transactionally consistent; the validated logical dump is the primary recovery source.
 
+The logical backup covers exactly one database: `POSTGRES_DB`, or the database matching `POSTGRES_USER` when `POSTGRES_DB` is absent. It does not dump every database in the PostgreSQL server and does not include cluster-wide objects such as global roles or tablespaces.
+
 If `--root` is omitted, discovery uses labels on running containers (or `docker compose ls` and a filesystem scan with `--all-projects`). Use `--sudo` where Docker access requires it. NFS-named volumes remain excluded unless `--include-nfs` is supplied.
 
 ## Restore
@@ -45,6 +47,12 @@ Archives without a manifest are recognized as the old format and continue throug
   --backup ./backups/app.example.com/project_20260718_120000.tar.gz \
   --volume project_uploads --overwrite
 ```
+
+## PostgreSQL storage limitations
+
+- Automatic logical restore currently supports PostgreSQL data stored in ordinary named Docker volumes. A bind mount such as `./postgres-data:/var/lib/postgresql/data` is not identified as a data volume to clean. Do not use automatic logical restore for that layout; prepare the bind directory manually before restoring.
+- External PostgreSQL volumes are not distinguished from Compose-managed named volumes. Restore may remove the recorded volume and then fail because Compose will not recreate a volume declared with `external: true`. Prepare and validate external volumes manually instead.
+- Keep a known-good backup until a backup produced by this version has been restored successfully in your own environment. The raw PostgreSQL volume copy is secondary and must not be treated as a consistent substitute for the logical dump.
 
 ## Security and backup strategy
 

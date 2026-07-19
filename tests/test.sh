@@ -213,6 +213,21 @@ assert_contains "$work/restore.log" 'Logical PostgreSQL restore succeeded' 'new 
 assert_contains "$work/docker.log" '-p sample' 'restore pins Compose to the project name recorded in the manifest'
 assert_contains "$work/restore.log" 'System check identified no issues' 'detected Django service is verified'
 
+# A failed pg_restore must stop the workflow before any remaining services start.
+restore_fail_log="$work/restore-fail.log"
+restore_fail_docker_log="$work/restore-fail-docker.log"
+if MOCK_SCENARIO=restore_fail MOCK_DOCKER_LOG="$restore_fail_docker_log" \
+  "$repo/compose-remote.sh" restore-remote --host mock --backup "$reformatted_archive" \
+  --target "$work/restore-fail-target" --overwrite --no-sudo >"$restore_fail_log" 2>&1; then
+  fail 'failed pg_restore returns a nonzero restore status'
+fi
+ok 'failed pg_restore returns a nonzero restore status'
+assert_contains "$restore_fail_log" 'ERROR: pg_restore failed' 'failed pg_restore prints a clear error'
+if grep -Eq ' up -d$' "$restore_fail_docker_log"; then fail 'failed pg_restore does not start remaining Compose services'; fi
+ok 'failed pg_restore does not start remaining Compose services'
+if grep -Fq 'Restore complete' "$restore_fail_log"; then fail 'failed pg_restore does not print Restore complete'; fi
+ok 'failed pg_restore does not print Restore complete'
+
 # A manifest-free archive follows the legacy restore path.
 mkdir -p "$work/legacy/sample/stack" "$work/legacy/sample/volumes/legacy_files"
 printf 'services: {}\n' > "$work/legacy/sample/stack/compose.yml"
