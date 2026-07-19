@@ -131,7 +131,16 @@ mkdir -p "$work/extracted"
 tar -xzf "$archive" -C "$work/extracted"
 manifest="$work/extracted/$project/metadata/manifest.json"
 dump="$work/extracted/$project/databases/datastore.dump"
-jq -e --arg project "$project" '.format_version == 2 and .project == $project and (.database_backups | length) == 1' "$manifest" >/dev/null
+python3 - "$manifest" "$project" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+assert manifest.get("format_version") == 2
+assert manifest.get("project") == sys.argv[2]
+assert len(manifest.get("database_backups", [])) == 1
+PY
 docker compose -p "$project" -f "$source_dir/compose.yml" exec -T datastore pg_restore --list < "$dump" >/dev/null
 
 echo "Destroying source stack and volumes"
