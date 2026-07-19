@@ -72,9 +72,15 @@ case "${1:-}" in
     elif [[ "$joined" == *'Config.Env'* ]]; then
       if [ "$is_pg" = 1 ] || [ "$scenario" = salvagewatch_shape ]; then printf 'POSTGRES_DB=sampledb\nPOSTGRES_USER=sampleuser\nPOSTGRES_PASSWORD=do-not-log-this\n'; fi
     elif [[ "$joined" == *'printf'*'%s|%s'* ]]; then
-      [ "$is_pg" = 1 ] && printf 'sample_data|/var/lib/postgresql/data\n'
+      if [ "$is_pg" = 1 ]; then
+        [ "$scenario" = parent_mount ] && printf 'sample_data|/var/lib/postgresql\n' || printf 'sample_data|/var/lib/postgresql/data\n'
+      fi
     elif [[ "$joined" == *'.Mounts'*'.Destination'* ]]; then
-      [ "$is_pg" = 1 ] && printf '/var/lib/postgresql/data\n' || printf '/data\n'
+      if [ "$is_pg" = 1 ]; then
+        [ "$scenario" = parent_mount ] && printf '/var/lib/postgresql\n' || printf '/var/lib/postgresql/data\n'
+      else
+        printf '/data\n'
+      fi
     elif [[ "$joined" == *'.Mounts'* ]]; then
       [ "$is_pg" = 1 ] && printf 'sample_data\n' || printf 'sample_uploads\n'
     fi ;;
@@ -185,6 +191,13 @@ assert_contains "$work/out/custom/stderr" 'PostgreSQL detected' 'custom image is
 
 run_backup salvagewatch_shape "$work/out/salvagewatch-shape"
 assert_contains "$work/out/salvagewatch-shape/stderr" 'service=datastore' 'application containers with PostgreSQL environment and client tools are not server candidates'
+
+run_backup parent_mount "$work/out/parent-mount"
+parent_archive=$(find "$work/out/parent-mount" -name '*.tar.gz' -type f)
+mkdir -p "$work/out/parent-mount/extracted"
+tar -xzf "$parent_archive" -C "$work/out/parent-mount/extracted"
+parent_manifest="$work/out/parent-mount/extracted/sample/metadata/manifest.json"
+assert_contains "$parent_manifest" '"data_volumes":["sample_data"]' 'parent PostgreSQL mount is recorded as a database data volume'
 
 if run_backup multiple "$work/out/multiple"; then fail 'multiple PostgreSQL candidates fail safely'; fi
 assert_contains "$work/out/multiple/stderr" 'Multiple PostgreSQL containers' 'multiple PostgreSQL candidates fail safely'

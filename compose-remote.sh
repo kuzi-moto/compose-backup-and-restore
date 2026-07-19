@@ -303,6 +303,14 @@ env_value() {
     | sed -n "s/^${key}=//p" | head -n 1
 }
 
+is_postgres_data_path() {
+  local mount_path="${1%/}" data_path="${2%/}"
+  [ -n "$mount_path" ] && [ -n "$data_path" ] || return 1
+  [ "$mount_path" = "$data_path" ] \
+    || [[ "$mount_path/" = "$data_path/"* ]] \
+    || [[ "$data_path/" = "$mount_path/"* ]]
+}
+
 detect_postgres() {
   pg_candidates=()
   while IFS= read -r cid; do
@@ -314,9 +322,14 @@ detect_postgres() {
       tools_signal=1
     fi
     data_signal=0
-    if $SUDO docker inspect --format "{{range .Mounts}}{{println .Destination}}{{end}}" "$cid" | grep -Eq "^(/var/lib/postgresql/data|/var/lib/postgresql)(/|$)"; then
-      data_signal=1
-    fi
+    candidate_pgdata=$(env_value "$cid" PGDATA)
+    [ -n "$candidate_pgdata" ] || candidate_pgdata="/var/lib/postgresql/data"
+    while IFS= read -r destination; do
+      if is_postgres_data_path "$destination" "$candidate_pgdata"; then
+        data_signal=1
+        break
+      fi
+    done < <($SUDO docker inspect --format "{{range .Mounts}}{{println .Destination}}{{end}}" "$cid")
     official_signal=0
     case "$image" in
       postgres|postgres:*|postgres@*|docker.io/postgres*|docker.io/library/postgres*|library/postgres*) official_signal=1 ;;
@@ -377,9 +390,9 @@ else
   pg_version=$($SUDO docker exec "$pg_container" pg_dump --version | sed -E "s/.* ([0-9]+(\.[0-9]+)?).*/\1/")
   while IFS="|" read -r source destination; do
     [ -n "$source" ] || continue
-    case "$destination/" in
-      "$pg_data_dir/"*|/var/lib/postgresql/data/*) pg_data_volumes+=("$source") ;;
-    esac
+    if is_postgres_data_path "$destination" "$pg_data_dir"; then
+      pg_data_volumes+=("$source")
+    fi
   done < <($SUDO docker inspect --format "{{range .Mounts}}{{if eq .Type \"volume\"}}{{printf \"%s|%s\\n\" .Name .Destination}}{{end}}{{end}}" "$pg_container")
   echo "PostgreSQL detected: service=$pg_service container=$pg_container database=$pg_database user=$pg_user" >&2
   echo "Creating online PostgreSQL logical dump (custom format)" >&2

@@ -36,7 +36,7 @@ services:
       POSTGRES_USER: integration_user
       POSTGRES_PASSWORD: disposable-password
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql
   web: &application
     build: ./app
     image: ${project}_application
@@ -140,6 +140,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 assert manifest.get("format_version") == 2
 assert manifest.get("project") == sys.argv[2]
 assert len(manifest.get("database_backups", [])) == 1
+assert f"{sys.argv[2]}_db_data" in manifest["database_backups"][0].get("data_volumes", [])
 PY
 docker compose -p "$project" -f "$source_dir/compose.yml" exec -T datastore pg_restore --list < "$dump" >/dev/null
 
@@ -158,5 +159,6 @@ volume_data=$(docker run --rm -v "${project}_uploads:/data:ro" alpine cat /data/
 [ "$volume_data" = "non-database-volume-data" ] || { echo "Non-database volume was not restored" >&2; exit 1; }
 grep -Fq "System check identified no issues" "$work/restore.log"
 grep -Fq "Compose restore project: $project" "$work/restore.log"
+grep -Fq "Skipping archived raw PostgreSQL volume ${project}_db_data" "$work/restore.log"
 
 echo "PASS: real PostgreSQL rows, non-database volume, project-pinned restore, and Django check verified"
