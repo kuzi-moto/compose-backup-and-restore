@@ -677,7 +677,10 @@ PY
     [ "$pg_dump_format" = "pg_dump_custom" ] || { echo "ERROR: Unsupported PostgreSQL dump format: $pg_dump_format" >&2; exit 2; }
     [ "$pg_validated" = "true" ] || { echo "ERROR: Manifest does not mark the PostgreSQL dump as validated" >&2; exit 2; }
     echo "$pg_service" | grep -Eq "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$" || { echo "ERROR: Invalid PostgreSQL service name in manifest" >&2; exit 2; }
-    logical_restore=1
+    if [ "${#pg_data_volumes[@]}" -eq 0 ]; then
+      echo "ERROR: Automatic logical restore requires PostgreSQL data in a named Docker volume; bind-mounted or unsupported storage cannot be cleaned safely" >&2
+      exit 2
+    fi
     echo "PostgreSQL data volumes selected for clean replacement: ${pg_data_volumes[*]:-(none)}"
     [ "$pg_dump_rel" = "databases/${pg_service}.dump" ] || { echo "ERROR: Unsafe or unexpected PostgreSQL dump path in manifest" >&2; exit 2; }
     pg_dump_file="$archive_root/$pg_dump_rel"
@@ -694,6 +697,7 @@ PY
       echo "ERROR: A logical PostgreSQL restore is destructive; use --overwrite to confirm replacement" >&2
       exit 2
     fi
+    logical_restore=1
   fi
 else
   echo "Restore source: legacy archive without a manifest; restoring stack files and volumes"

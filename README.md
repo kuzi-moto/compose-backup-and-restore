@@ -50,7 +50,7 @@ Archives without a manifest are recognized as the old format and continue throug
 
 ## PostgreSQL storage limitations
 
-- Automatic logical restore currently supports PostgreSQL data stored in ordinary named Docker volumes. A bind mount such as `./postgres-data:/var/lib/postgresql/data` is not identified as a data volume to clean. Do not use automatic logical restore for that layout; prepare the bind directory manually before restoring.
+- Automatic logical restore currently supports PostgreSQL data stored in ordinary named Docker volumes. A bind mount such as `./postgres-data:/var/lib/postgresql/data` cannot be cleaned safely, so archives without a recorded named PostgreSQL data volume are rejected before services or volumes are changed. Prepare bind-mounted storage manually before restoring.
 - External PostgreSQL volumes are not distinguished from Compose-managed named volumes. Restore may remove the recorded volume and then fail because Compose will not recreate a volume declared with `external: true`. Prepare and validate external volumes manually instead.
 - Keep a known-good backup until a backup produced by this version has been restored successfully in your own environment. The raw PostgreSQL volume copy is secondary and must not be treated as a consistent substitute for the logical dump.
 

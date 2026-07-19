@@ -218,6 +218,42 @@ python3 -m json.tool "$manifest" > "$manifest.reformatted"
 mv "$manifest.reformatted" "$manifest"
 reformatted_archive="$work/reformatted-v2.tar.gz"
 tar -C "$work/out/official/extracted" -czf "$reformatted_archive" sample
+
+# A logical dump without a named PGDATA volume must fail before any destructive action.
+unsupported_root="$work/unsupported-storage"
+mkdir -p "$unsupported_root" "$work/unsupported-target"
+cp -a "$work/out/official/extracted/sample" "$unsupported_root/sample"
+python3 - "$unsupported_root/sample/metadata/manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+manifest["database_backups"][0]["data_volumes"] = []
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+printf 'services: {}\n' > "$work/unsupported-target/compose.yml"
+unsupported_archive="$work/unsupported-storage.tar.gz"
+tar -C "$unsupported_root" -czf "$unsupported_archive" sample
+unsupported_log="$work/unsupported-storage.log"
+unsupported_docker_log="$work/unsupported-storage-docker.log"
+: > "$unsupported_docker_log"
+if MOCK_SCENARIO=official MOCK_DOCKER_LOG="$unsupported_docker_log" \
+  "$repo/compose-remote.sh" restore-remote --host mock --backup "$unsupported_archive" \
+  --target "$work/unsupported-target" --overwrite --no-sudo >"$unsupported_log" 2>&1; then
+  fail 'logical restore without a named PGDATA volume exits nonzero'
+fi
+ok 'logical restore without a named PGDATA volume exits nonzero'
+assert_contains "$unsupported_log" 'bind-mounted or unsupported storage' 'unsupported PostgreSQL storage prints a clear error'
+if grep -Eq ' (stop|down)$' "$unsupported_docker_log"; then fail 'unsupported PostgreSQL storage does not stop services'; fi
+ok 'unsupported PostgreSQL storage does not stop services'
+if grep -Fq 'volume rm' "$unsupported_docker_log"; then fail 'unsupported PostgreSQL storage does not remove volumes'; fi
+ok 'unsupported PostgreSQL storage does not remove volumes'
+if grep -Fq 'pg_restore' "$unsupported_docker_log"; then fail 'unsupported PostgreSQL storage does not run pg_restore'; fi
+ok 'unsupported PostgreSQL storage does not run pg_restore'
+
 MOCK_SCENARIO=official "$repo/compose-remote.sh" restore-remote --host mock --backup "$reformatted_archive" --target "$work/restored" --overwrite --no-sudo >"$work/restore.log" 2>&1
 assert_contains "$work/restore.log" 'format-version 2 archive with manifest' 'restore parses a reformatted JSON manifest'
 assert_contains "$work/restore.log" 'Skipping archived raw PostgreSQL volume sample_data' 'logical restore replaces rather than overlays raw PostgreSQL volume'
