@@ -309,10 +309,6 @@ detect_postgres() {
     [ -n "$cid" ] || continue
     service=$($SUDO docker inspect --format "{{index .Config.Labels \"com.docker.compose.service\"}}" "$cid")
     image=$($SUDO docker inspect --format "{{.Config.Image}}" "$cid")
-    env_signal=0
-    if $SUDO docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" "$cid" | grep -Eq "^POSTGRES_(DB|USER|PASSWORD|HOST_AUTH_METHOD)="; then
-      env_signal=1
-    fi
     tools_signal=0
     if $SUDO docker exec "$cid" sh -c "command -v pg_dump >/dev/null && command -v pg_restore >/dev/null" >/dev/null 2>&1; then
       tools_signal=1
@@ -325,12 +321,11 @@ detect_postgres() {
     case "$image" in
       postgres|postgres:*|postgres@*|docker.io/postgres*|docker.io/library/postgres*|library/postgres*) official_signal=1 ;;
     esac
-    if [ "$official_signal" = "1" ] || [ "$env_signal" = "1" ] || { [ "$tools_signal" = "1" ] && [ "$data_signal" = "1" ]; }; then
-      if [ "$tools_signal" != "1" ]; then
-        echo "ERROR: PostgreSQL candidate service $service ($cid) does not provide both pg_dump and pg_restore" >&2
-        exit 4
-      fi
+    if [ "$tools_signal" = "1" ] && { [ "$official_signal" = "1" ] || [ "$data_signal" = "1" ]; }; then
       pg_candidates+=("$cid")
+    elif [ "$official_signal" = "1" ] || [ "$data_signal" = "1" ]; then
+      echo "ERROR: PostgreSQL server candidate service $service ($cid) does not provide both pg_dump and pg_restore" >&2
+      exit 4
     fi
   done < <($SUDO docker ps -q --filter "label=com.docker.compose.project=$project_name")
 
@@ -602,21 +597,76 @@ pg_database=""
 pg_user=""
 pg_dump_file=""
 pg_data_volumes=()
+manifest_project=""
 
 if [ -f "$manifest" ]; then
-  format_version=$(sed -n "s/.*\"format_version\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$manifest" | head -n 1)
+  if command -v jq >/dev/null 2>&1; then
+    format_version=$(jq -er ".format_version" "$manifest")
+    manifest_project=$(jq -er ".project" "$manifest")
+    database_count=$(jq -er ".database_backups | length" "$manifest")
+    if [ "$database_count" = "1" ]; then
+      pg_engine=$(jq -er ".database_backups[0].engine" "$manifest")
+      pg_service=$(jq -er ".database_backups[0].service" "$manifest")
+      pg_database=$(jq -er ".database_backups[0].database" "$manifest")
+      pg_user=$(jq -er ".database_backups[0].user" "$manifest")
+      pg_dump_format=$(jq -er ".database_backups[0].format" "$manifest")
+      pg_dump_rel=$(jq -er ".database_backups[0].file" "$manifest")
+      pg_validated=$(jq -er ".database_backups[0].validated" "$manifest")
+      while IFS= read -r volume; do [ -n "$volume" ] && pg_data_volumes+=("$volume"); done < <(jq -er ".database_backups[0].data_volumes[]?" "$manifest")
+    fi
+  elif command -v python3 >/dev/null 2>&1; then
+    parsed_manifest=$(python3 - "$manifest" <<PY
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+databases = data.get("database_backups", [])
+print(data.get("format_version", ""))
+print(data.get("project", ""))
+print(len(databases))
+if len(databases) == 1:
+    database = databases[0]
+    for key in ("engine", "service", "database", "user", "format", "file", "validated"):
+        value = database.get(key, "")
+        print(str(value).lower() if isinstance(value, bool) else value)
+    for volume in database.get("data_volumes", []):
+        print(volume)
+PY
+)
+    exec 3<<< "$parsed_manifest"
+    IFS= read -r format_version <&3
+    IFS= read -r manifest_project <&3
+    IFS= read -r database_count <&3
+    if [ "$database_count" = "1" ]; then
+      IFS= read -r pg_engine <&3
+      IFS= read -r pg_service <&3
+      IFS= read -r pg_database <&3
+      IFS= read -r pg_user <&3
+      IFS= read -r pg_dump_format <&3
+      IFS= read -r pg_dump_rel <&3
+      IFS= read -r pg_validated <&3
+      while IFS= read -r volume <&3; do [ -n "$volume" ] && pg_data_volumes+=("$volume"); done
+    fi
+    exec 3<&-
+  else
+    echo "ERROR: Restoring a versioned manifest requires jq or python3 on the remote host" >&2
+    exit 2
+  fi
   [ "$format_version" = "2" ] || { echo "ERROR: Unsupported manifest format version: ${format_version:-unknown}" >&2; exit 2; }
+  echo "$database_count" | grep -Eq "^[0-9]+$" || { echo "ERROR: Invalid database_backups value in manifest" >&2; exit 2; }
+  [ "$database_count" -le 1 ] || { echo "ERROR: Multiple database backups are present; refusing to select one automatically" >&2; exit 2; }
+  echo "$manifest_project" | grep -Eq "^[a-z0-9][a-z0-9_-]*$" || { echo "ERROR: Invalid Compose project name in manifest" >&2; exit 2; }
   echo "Restore source: format-version 2 archive with manifest"
-  if grep -q "\"engine\":\"postgresql\"" "$manifest"; then
+  echo "Compose restore project: $manifest_project"
+  if [ "$database_count" = "1" ]; then
+    [ "$pg_engine" = "postgresql" ] || { echo "ERROR: Unsupported database engine in manifest: $pg_engine" >&2; exit 2; }
+    [ "$pg_dump_format" = "pg_dump_custom" ] || { echo "ERROR: Unsupported PostgreSQL dump format: $pg_dump_format" >&2; exit 2; }
+    [ "$pg_validated" = "true" ] || { echo "ERROR: Manifest does not mark the PostgreSQL dump as validated" >&2; exit 2; }
+    echo "$pg_service" | grep -Eq "^[a-zA-Z0-9][a-zA-Z0-9_.-]*$" || { echo "ERROR: Invalid PostgreSQL service name in manifest" >&2; exit 2; }
     logical_restore=1
-    pg_service=$(sed -n "s/.*\"service\":\"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1)
-    pg_database=$(sed -n "s/.*\"database\":\"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1)
-    pg_user=$(sed -n "s/.*\"user\":\"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1)
-    pg_dump_rel=$(sed -n "s/.*\"file\":\"\([^\"]*\)\".*/\1/p" "$manifest" | head -n 1)
-    data_volume_list=$(sed -n "s/.*\"data_volumes\":\[\([^]]*\)\].*/\1/p" "$manifest" | head -n 1)
-    while IFS= read -r volume; do [ -n "$volume" ] && pg_data_volumes+=("$volume"); done < <(printf "%s\n" "$data_volume_list" | tr "," "\n" | tr -d "\" ")
     echo "PostgreSQL data volumes selected for clean replacement: ${pg_data_volumes[*]:-(none)}"
-    case "$pg_dump_rel" in databases/*.dump) ;; *) echo "ERROR: Unsafe PostgreSQL dump path in manifest" >&2; exit 2;; esac
+    [ "$pg_dump_rel" = "databases/${pg_service}.dump" ] || { echo "ERROR: Unsafe or unexpected PostgreSQL dump path in manifest" >&2; exit 2; }
     pg_dump_file="$archive_root/$pg_dump_rel"
     [ -n "$pg_service" ] && [ -n "$pg_database" ] && [ -n "$pg_user" ] && [ -f "$pg_dump_file" ] || { echo "ERROR: PostgreSQL manifest entry is incomplete or dump is missing" >&2; exit 2; }
     dump_checksum="$pg_dump_file.sha256"
@@ -636,6 +686,19 @@ else
   echo "Restore source: legacy archive without a manifest; restoring stack files and volumes"
 fi
 
+run_restore_compose() {
+  local workdir="$1"
+  shift
+  (
+    cd "$workdir"
+    if [ -n "$manifest_project" ]; then
+      $compose_cmd -p "$manifest_project" "$@"
+    else
+      $compose_cmd "$@"
+    fi
+  )
+}
+
 old_compose_file=""
 if [ -n "$compose_cmd" ] && [ -d "$target_dir" ]; then
   for file in "$target_dir/docker-compose.yml" "$target_dir/docker-compose.yaml" "$target_dir/compose.yml" "$target_dir/compose.yaml"; do
@@ -649,10 +712,19 @@ if [ -n "$old_compose_file" ] && { [ "$stop_stack" = "1" ] || [ "$logical_restor
   [ "$logical_restore" != "1" ] || echo "Stopping existing services before destructive PostgreSQL restoration"
   if [ "$logical_restore" = "1" ]; then
     # Removing stopped containers releases named volumes so they can be recreated cleanly.
-    (cd "$target_dir" && $compose_cmd -f "$old_compose_file" down) || true
+    run_restore_compose "$target_dir" -f "$old_compose_file" down || true
   else
-    (cd "$target_dir" && $compose_cmd -f "$old_compose_file" stop) || true
+    run_restore_compose "$target_dir" -f "$old_compose_file" stop || true
   fi
+fi
+
+if [ "$logical_restore" = "1" ]; then
+  for pg_volume in ${pg_data_volumes[@]+"${pg_data_volumes[@]}"}; do
+    if $SUDO docker volume inspect "$pg_volume" >/dev/null 2>&1; then
+      echo "Removing PostgreSQL data volume for clean logical restore: $pg_volume"
+      $SUDO docker volume rm -f "$pg_volume" >/dev/null
+    fi
+  done
 fi
 
 if [ -d "$stack_src" ]; then
@@ -675,11 +747,7 @@ if [ -d "$vol_src" ]; then
       done
     fi
     if [ "$skip_volume" = "1" ]; then
-      echo "Skipping archived raw PostgreSQL volume $volume_name; recreating it cleanly for logical restore"
-      if $SUDO docker volume inspect "$volume_name" >/dev/null 2>&1; then
-        $SUDO docker volume rm -f "$volume_name" >/dev/null
-      fi
-      $SUDO docker volume create "$volume_name" >/dev/null
+      echo "Skipping archived raw PostgreSQL volume $volume_name; Compose will recreate it cleanly for logical restore"
       continue
     fi
 
@@ -693,9 +761,8 @@ if [ -d "$vol_src" ]; then
     fi
 
     $SUDO docker volume create "$volume_name" >/dev/null
-    mountpoint=$($SUDO docker volume inspect "$volume_name" --format "{{ .Mountpoint }}")
-    [ -n "$mountpoint" ] || continue
-    $SUDO tar -C "$volume_dir" -cf - . | $SUDO tar -C "$mountpoint" -xf -
+    $SUDO tar -C "$volume_dir" -cf - . \
+      | $SUDO docker run --rm -i -v "$volume_name:/dst" alpine tar -C /dst -xf -
     echo "Restored non-database volume: $volume_name"
   done
 fi
@@ -708,10 +775,10 @@ if [ "$logical_restore" = "1" ]; then
   done
   [ -n "$compose_file" ] || { echo "ERROR: No Compose file found in restored stack" >&2; exit 7; }
   echo "Starting only PostgreSQL service: $pg_service"
-  (cd "$target_dir" && $compose_cmd -f "$compose_file" up -d "$pg_service")
+  run_restore_compose "$target_dir" -f "$compose_file" up -d "$pg_service"
   ready=0
   for attempt in $(seq 1 60); do
-    if (cd "$target_dir" && $compose_cmd -f "$compose_file" exec -T "$pg_service" pg_isready -U "$pg_user" -d "$pg_database") >/dev/null 2>&1; then
+    if run_restore_compose "$target_dir" -f "$compose_file" exec -T "$pg_service" pg_isready -U "$pg_user" -d "$pg_database" >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -719,34 +786,43 @@ if [ "$logical_restore" = "1" ]; then
   done
   [ "$ready" = "1" ] || { echo "ERROR: PostgreSQL did not become ready within 120 seconds" >&2; exit 8; }
   echo "PostgreSQL is accepting connections; restoring logical dump"
-  if ! (cd "$target_dir" && $compose_cmd -f "$compose_file" exec -T "$pg_service" sh -c "if [ -n \"\${POSTGRES_PASSWORD:-}\" ]; then export PGPASSWORD=\"\$POSTGRES_PASSWORD\"; fi; exec pg_restore --clean --if-exists --no-owner --no-acl --username \"\$1\" --dbname \"\$2\"" sh "$pg_user" "$pg_database") < "$pg_dump_file"; then
+  if ! run_restore_compose "$target_dir" -f "$compose_file" exec -T "$pg_service" sh -c "if [ -n \"\${POSTGRES_PASSWORD:-}\" ]; then export PGPASSWORD=\"\$POSTGRES_PASSWORD\"; fi; exec pg_restore --clean --if-exists --no-owner --no-acl --username \"\$1\" --dbname \"\$2\"" sh "$pg_user" "$pg_database" < "$pg_dump_file"; then
     echo "ERROR: pg_restore failed for service $pg_service database $pg_database" >&2
     exit 9
   fi
-  if ! (cd "$target_dir" && $compose_cmd -f "$compose_file" exec -T "$pg_service" pg_isready -U "$pg_user" -d "$pg_database") >/dev/null; then
+  if ! run_restore_compose "$target_dir" -f "$compose_file" exec -T "$pg_service" pg_isready -U "$pg_user" -d "$pg_database" >/dev/null; then
     echo "ERROR: PostgreSQL stopped accepting connections after restore" >&2
     exit 9
   fi
   echo "Logical PostgreSQL restore succeeded: service=$pg_service database=$pg_database user=$pg_user"
   echo "Starting remaining Compose services"
-  (cd "$target_dir" && $compose_cmd -f "$compose_file" up -d)
+  run_restore_compose "$target_dir" -f "$compose_file" up -d
 
   django_candidates=()
   while IFS= read -r service; do
     [ -n "$service" ] || continue
     [ "$service" = "$pg_service" ] && continue
-    if (cd "$target_dir" && $compose_cmd -f "$compose_file" exec -T "$service" test -f manage.py) >/dev/null 2>&1; then
+    if run_restore_compose "$target_dir" -f "$compose_file" exec -T "$service" test -f manage.py >/dev/null 2>&1; then
       django_candidates+=("$service")
     fi
-  done < <(cd "$target_dir" && $compose_cmd -f "$compose_file" config --services)
+  done < <(run_restore_compose "$target_dir" -f "$compose_file" config --services)
   if [ "${#django_candidates[@]}" -eq 1 ]; then
     django_service="${django_candidates[0]}"
     echo "Running Django verification through service: $django_service"
-    (cd "$target_dir" && $compose_cmd -f "$compose_file" exec -T "$django_service" python manage.py check)
+    run_restore_compose "$target_dir" -f "$compose_file" exec -T "$django_service" python manage.py check
   elif [ "${#django_candidates[@]}" -gt 1 ]; then
-    echo "Multiple services contain manage.py; run the appropriate service manually: $compose_cmd -f $compose_file exec -T SERVICE python manage.py check"
+    django_service=""
+    for service in ${django_candidates[@]+"${django_candidates[@]}"}; do
+      if [ "$service" = "web" ]; then django_service="$service"; break; fi
+    done
+    if [ -n "$django_service" ]; then
+      echo "Running Django verification through conventional web service: $django_service"
+      run_restore_compose "$target_dir" -f "$compose_file" exec -T "$django_service" python manage.py check
+    else
+      echo "Multiple services contain manage.py; run the appropriate service manually: $compose_cmd -p $manifest_project -f $compose_file exec -T SERVICE python manage.py check"
+    fi
   else
-    echo "No Django service was detected confidently. If applicable, verify manually with: $compose_cmd -f $compose_file exec -T SERVICE python manage.py check"
+    echo "No Django service was detected confidently. If applicable, verify manually with: $compose_cmd -p $manifest_project -f $compose_file exec -T SERVICE python manage.py check"
   fi
 fi
 

@@ -21,10 +21,11 @@ cat > "$work/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 scenario=${MOCK_SCENARIO:-official}
+printf '%s\n' "$*" >> "${MOCK_DOCKER_LOG:-/dev/null}"
 if [ "${1:-}" = compose ] || [[ "$0" = *docker-compose ]]; then
   [ "${1:-}" != compose ] || shift
   if [ "${1:-}" = version ]; then exit 0; fi
-  if [ "${1:-}" = -f ]; then shift 2; fi
+  while [ "${1:-}" = -p ] || [ "${1:-}" = -f ]; do shift 2; done
   case "${1:-}" in
     config)
       if [ "${2:-}" = --volumes ]; then printf 'sample_data\nsample_uploads\n'; else printf 'datastore\nweb\n'; fi ;;
@@ -54,6 +55,7 @@ case "${1:-}" in
       case "$scenario" in
         no_postgres) printf 'app1\n' ;;
         multiple) printf 'cid1\ncid2\n' ;;
+        salvagewatch_shape) printf 'cid1\napp1\napp2\napp3\n' ;;
         *) printf 'cid1\napp1\n' ;;
       esac
     fi ;;
@@ -68,7 +70,7 @@ case "${1:-}" in
         [ "$scenario" = custom ] && printf 'company/internal-db:latest\n' || printf 'postgres:16\n'
       else printf 'alpine:3\n'; fi
     elif [[ "$joined" == *'Config.Env'* ]]; then
-      if [ "$is_pg" = 1 ]; then printf 'POSTGRES_DB=sampledb\nPOSTGRES_USER=sampleuser\nPOSTGRES_PASSWORD=do-not-log-this\n'; fi
+      if [ "$is_pg" = 1 ] || [ "$scenario" = salvagewatch_shape ]; then printf 'POSTGRES_DB=sampledb\nPOSTGRES_USER=sampleuser\nPOSTGRES_PASSWORD=do-not-log-this\n'; fi
     elif [[ "$joined" == *'printf'*'%s|%s'* ]]; then
       [ "$is_pg" = 1 ] && printf 'sample_data|/var/lib/postgresql/data\n'
     elif [[ "$joined" == *'.Mounts'*'.Destination'* ]]; then
@@ -79,7 +81,7 @@ case "${1:-}" in
   exec)
     cid=$2; shift 2; joined="$*"
     if [[ "$joined" == *'command -v pg_dump'* ]]; then
-      case "$cid" in cid1|cid2) exit 0;; *) exit 1;; esac
+      case "$cid" in cid1|cid2) exit 0;; app*) [ "$scenario" = salvagewatch_shape ];; *) exit 1;; esac
     elif [[ "$joined" == *'pg_dump --version'* ]]; then printf 'pg_dump (PostgreSQL) 16.4\n'
     elif [[ "$joined" == *'pg_database_size'* ]]; then printf '1024\n'
     elif [[ "$joined" == *'pg_restore --list'* ]]; then
@@ -100,6 +102,22 @@ case "${1:-}" in
       rm) name="${!#}"; rm -rf "$MOCK_VOLUME_ROOT/$name" ;;
     esac ;;
   run)
+    if [[ " $* " == *' -i '* ]]; then
+      restore_volume=""
+      shift
+      while [ $# -gt 0 ]; do
+        if [ "$1" = -v ]; then
+          mapping=$2; shift 2
+          if [ "${mapping#*:}" = /dst ]; then restore_volume=${mapping%%:*}; fi
+        else
+          shift
+        fi
+      done
+      [ -n "$restore_volume" ] || exit 1
+      mkdir -p "$MOCK_VOLUME_ROOT/$restore_volume"
+      tar -C "$MOCK_VOLUME_ROOT/$restore_volume" -xf -
+      exit 0
+    fi
     stage=$(mktemp -d /tmp/mock-docker-run.XXXXXX); trap 'rm -rf "$stage"' EXIT
     mkdir -p "$stage/src"
     shift
@@ -127,12 +145,13 @@ ln -s docker "$work/bin/docker-compose"
 export PATH="$work/bin:$PATH"
 export MOCK_PROJECT_DIR="$work/project"
 export MOCK_VOLUME_ROOT="$work/volumes"
+export MOCK_DOCKER_LOG="$work/docker.log"
 remote_tmp_before=$(find /tmp -maxdepth 1 -type d -name 'compose_backup.*' | wc -l | tr -d ' ')
 
 passed=0
 ok() { passed=$((passed + 1)); printf 'ok %d - %s\n' "$passed" "$1"; }
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
-assert_contains() { grep -Fq "$2" "$1" || { printf '%s\n' "--- $1" >&2; sed -n '1,120p' "$1" >&2; fail "$3"; }; ok "$3"; }
+assert_contains() { grep -Fq -- "$2" "$1" || { printf '%s\n' "--- $1" >&2; sed -n '1,120p' "$1" >&2; fail "$3"; }; ok "$3"; }
 
 run_backup() {
   local scenario=$1 dir=$2
@@ -162,7 +181,10 @@ assert_contains "$manifest" '"data_volumes":["sample_data"]' 'manifest identifie
 if grep -R -Fq 'do-not-log-this' "$work/out/official/stdout" "$work/out/official/stderr"; then fail 'password is absent from normal output'; fi; ok 'password is absent from normal output'
 
 run_backup custom "$work/out/custom"
-assert_contains "$work/out/custom/stderr" 'PostgreSQL detected' 'custom image is detected from PostgreSQL environment and tools'
+assert_contains "$work/out/custom/stderr" 'PostgreSQL detected' 'custom image is detected from PostgreSQL data mount and tools'
+
+run_backup salvagewatch_shape "$work/out/salvagewatch-shape"
+assert_contains "$work/out/salvagewatch-shape/stderr" 'service=datastore' 'application containers with PostgreSQL environment and client tools are not server candidates'
 
 if run_backup multiple "$work/out/multiple"; then fail 'multiple PostgreSQL candidates fail safely'; fi
 assert_contains "$work/out/multiple/stderr" 'Multiple PostgreSQL containers' 'multiple PostgreSQL candidates fail safely'
@@ -179,10 +201,16 @@ remote_tmp_after=$(find /tmp -maxdepth 1 -type d -name 'compose_backup.*' | wc -
 
 # Restore the version 2 archive through the same mocked SSH and Docker boundary.
 printf 'stale database bytes\n' > "$work/volumes/sample_data/stale"
-MOCK_SCENARIO=official "$repo/compose-remote.sh" restore-remote --host mock --backup "$archive" --target "$work/restored" --overwrite --no-sudo >"$work/restore.log" 2>&1
+python3 -m json.tool "$manifest" > "$manifest.reformatted"
+mv "$manifest.reformatted" "$manifest"
+reformatted_archive="$work/reformatted-v2.tar.gz"
+tar -C "$work/out/official/extracted" -czf "$reformatted_archive" sample
+MOCK_SCENARIO=official "$repo/compose-remote.sh" restore-remote --host mock --backup "$reformatted_archive" --target "$work/restored" --overwrite --no-sudo >"$work/restore.log" 2>&1
+assert_contains "$work/restore.log" 'format-version 2 archive with manifest' 'restore parses a reformatted JSON manifest'
 assert_contains "$work/restore.log" 'Skipping archived raw PostgreSQL volume sample_data' 'logical restore replaces rather than overlays raw PostgreSQL volume'
 assert_contains "$work/restore.log" 'Restored non-database volume: sample_uploads' 'logical restore preserves non-database volumes'
 assert_contains "$work/restore.log" 'Logical PostgreSQL restore succeeded' 'new archive performs logical PostgreSQL restore'
+assert_contains "$work/docker.log" '-p sample' 'restore pins Compose to the project name recorded in the manifest'
 assert_contains "$work/restore.log" 'System check identified no issues' 'detected Django service is verified'
 
 # A manifest-free archive follows the legacy restore path.

@@ -8,7 +8,7 @@
 ./compose-remote.sh backup-remote --host app.example.com --user deploy --dest ./backups
 ```
 
-The script discovers running Compose projects by default. For every running container it checks several PostgreSQL signals: an official `postgres` image, `POSTGRES_*` environment variables, PostgreSQL client tools, and a PostgreSQL data-directory mount. The candidate must contain both `pg_dump` and `pg_restore`. No candidate keeps the generic backup behavior; more than one candidate fails safely instead of guessing. The detected service, container, database, and user are printed, but passwords are not.
+The script discovers running Compose projects by default. A PostgreSQL server candidate must contain both `pg_dump` and `pg_restore` and must either use an official `postgres` image or mount PostgreSQL's data directory. `POSTGRES_*` environment variables help select the database and user but never qualify a container by themselves, so application and worker containers with PostgreSQL client tools are ignored. No candidate keeps the generic backup behavior; more than one candidate fails safely instead of guessing. The detected service, container, database, and user are printed, but passwords are not.
 
 For a single candidate, the script runs an online custom-format `pg_dump` with `--no-owner --no-acl`, then validates it with `pg_restore --list`. A failed dump or validation leaves no final archive: the local `.part` file and controlled remote temporary directory are cleaned up. Each dump and completed archive receives a SHA-256 checksum.
 
@@ -36,7 +36,7 @@ If `--root` is omitted, discovery uses labels on running containers (or `docker 
   --target /srv/salvagewatch --overwrite
 ```
 
-For a version 2 archive with a logical dump, `--overwrite` is required because database restoration is destructive. Restore stops existing services, restores stack files and non-database volumes, skips the archived raw PostgreSQL data volume and recreates it cleanly, starts only the detected database service, waits with `pg_isready`, and runs `pg_restore --clean --if-exists --no-owner --no-acl`. It verifies readiness again, starts the remaining services, and runs `python manage.py check` when exactly one Compose service can be identified confidently as Django. Otherwise it prints a manual check command.
+For a version 2 archive with a logical dump, `--overwrite` is required because database restoration is destructive. Restore uses the project name recorded in the manifest (`docker compose -p`) even when the target directory has a different name. It stops existing services, restores stack files and non-database volumes, removes the archived raw PostgreSQL data volume and lets Compose recreate it with the configured driver and options, starts only the detected database service, waits with `pg_isready`, and runs `pg_restore --clean --if-exists --no-owner --no-acl`. It verifies readiness again, starts the remaining services, and runs `python manage.py check` when one service can be identified confidently as Django (including a conventional `web` service among several workers). Otherwise it prints a manual check command. Versioned manifests are parsed with `jq` or Python's JSON parser rather than regular expressions.
 
 Archives without a manifest are recognized as the old format and continue through the original stack-and-volume restore path. `restore-local-volume` also remains compatible with both formats:
 
@@ -57,6 +57,14 @@ Inspect a backup with `tar -tzf BACKUP.tar.gz`; extract it and run `pg_restore -
 ```bash
 bash tests/test.sh
 ```
+
+When Docker is available, run the opt-in real-container integration test with:
+
+```bash
+bash tests/integration-postgres.sh
+```
+
+It builds a disposable Django application image with PostgreSQL client tools, starts several application/worker containers alongside `postgres:16-alpine`, inserts real rows, backs up with genuine `pg_dump`, destroys the stack and volumes, restores into a differently named directory, and verifies the rows, non-database volume, pinned Compose project, and Django system check. SSH alone is looped back locally. All credentials and data are disposable.
 
 For a manual end-to-end test, create a disposable Compose project using `postgres:16` plus a named non-database volume, insert several sample rows, run `backup-remote`, inspect the manifest and validate the dump, then restore with `--overwrite` to a clean target. Confirm the rows and the non-database volume contents, and separately restore a manifest-free archive. Never use production SalvageWatch credentials or data for this test.
 
